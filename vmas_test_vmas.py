@@ -101,8 +101,8 @@ if __name__ == "__main__":
 
     # Run loop
     for ep in range(1):  # single episode
-        obs_list = env.reset()
-        print(obs_list.shape)
+        obs_list = env.reset() # obs_list contain (num_env, obs_len) for each agents
+        print(len(obs_list))
         start_time = time.time()
         for step in range(args.max_step):
             # Stack observations: shape [num_envs, num_agents, obs_dim]
