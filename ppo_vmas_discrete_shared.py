@@ -18,7 +18,8 @@ import vmas
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
+    parser.add_argument("--exp-name", type=str,
+        default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
     parser.add_argument("--scenario", type=str, default="navigation",
         help="the id of the gym environment")
@@ -26,60 +27,68 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--total-timesteps", type=int, default=500_000,
-        help="total timesteps of the experiments")
-    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--total-timesteps", type=int, default=10_000_000,
+        help="total timesteps (frames) for the experiment")
+    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)),
+        default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
-    parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="ppo-implementation-details",
-        help="the wandb's project name")
+    parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)),
+        default=True, nargs="?", const=True,
+        help="if toggled, cuda will be enabled")
+    parser.add_argument("--track", type=lambda x: bool(strtobool(x)),
+        default=False, nargs="?", const=True,
+        help="if toggled, track with Weights & Biases")
+    parser.add_argument("--wandb-project-name", type=str,
+        default="ppo-implementation-details",
+        help="Weights & Biases project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
-        help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="weather to capture videos of the agent performances (check out `videos` folder)")
+        help="Weights & Biases entity/team")
 
     # Algorithm specific arguments
     parser.add_argument("--num-agents", type=int, default=8,
-        help="the number of agent in game")
-    parser.add_argument("--num-envs", type=int, default=32,
-        help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=256,
-        help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="number of agents in the environment")
+    parser.add_argument("--num-envs", type=int, default=600,
+        help="number of parallel envs per worker (=> 600*100=60k frames/batch)")
+    parser.add_argument("--num-steps", type=int, default=100,
+        help="number of steps per env per rollout (100 => 60k frames)")
+    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)),
+        default=True, nargs="?", const=True,
+        help="Toggle learning rate annealing")
+    parser.add_argument("--gae", type=lambda x: bool(strtobool(x)),
+        default=True, nargs="?", const=True,
         help="Use GAE for advantage computation")
     parser.add_argument("--gamma", type=float, default=0.99,
-        help="the discount factor gamma")
+        help="discount factor γ")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
-        help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=4,
-        help="the number of mini-batches")
+        help="GAE λ")
+    parser.add_argument("--num-minibatches", type=int, default=45,
+        help="number of PPO minibatch passes per epoch")
     parser.add_argument("--update-epochs", type=int, default=4,
-        help="the K epochs to update the policy")
-    parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggles advantages normalization")
+        help="number of PPO update epochs")
+    parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)),
+        default=True, nargs="?", const=True,
+        help="Toggles advantage normalization")
     parser.add_argument("--clip-coef", type=float, default=0.2,
-        help="the surrogate clipping coefficient")
-    parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
+        help="PPO clip coefficient")
+    parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)),
+        default=True, nargs="?", const=True,
+        help="Toggles clipped value loss")
     parser.add_argument("--ent-coef", type=float, default=0.01,
-        help="coefficient of the entropy")
+        help="entropy bonus coefficient")
     parser.add_argument("--vf-coef", type=float, default=0.5,
-        help="coefficient of the value function")
+        help="value loss coefficient")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
-        help="the maximum norm for the gradient clipping")
+        help="max gradient norm")
     parser.add_argument("--target-kl", type=float, default=None,
-        help="the target KL divergence threshold")
+        help="PPO target KL (early stop)")
+
     args = parser.parse_args()
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    # total batch size = num_envs * num_steps = 600 * 100 = 60_000
+    args.batch_size = args.num_envs * args.num_steps
+    # minibatch size per update = batch_size // num_minibatches = 60_000 / 45 ≈ 1333
+    args.minibatch_size = args.batch_size // args.num_minibatches
     # fmt: on
     return args
-
 
 def make_env(scenario, num_envs, continuous_actions, seed, device, n_agents):
     return vmas.make_env(
@@ -89,7 +98,7 @@ def make_env(scenario, num_envs, continuous_actions, seed, device, n_agents):
         continuous_actions=continuous_actions,
         seed=seed,
         n_agents=n_agents,
-        max_steps=1000,
+        max_steps=100,
     )
 
 
@@ -248,8 +257,8 @@ if __name__ == "__main__":
                     episode_lengths[i] = 0
             
             # logging episode return and length
-            if episode_ret:
-                # print(f"global_step={global_step}, episodic_return={np.mean(episode_ret)}")
+            if episode_ret and global_step > 100:
+                print(f"global_step={global_step}, episodic_return={np.mean(episode_ret)}")
                 writer.add_scalar("charts/episodic_return", np.mean(episode_ret), global_step)
                 writer.add_scalar("charts/episodic_length", np.mean(episode_len), global_step)
 
@@ -360,7 +369,7 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    torch.save(agent.actor.state_dict(), "actor_vmas.pth")
-    torch.save(agent.critic.state_dict(), "critic_vmas.pth")
+    torch.save(agent.actor.state_dict(), "actor_vmas_shared.pth")
+    torch.save(agent.critic.state_dict(), "critic_vmas_shared.pth")
     
     writer.close()
