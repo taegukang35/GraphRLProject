@@ -45,7 +45,7 @@ def parse_args():
         help="Weights & Biases entity/team")
 
     # Algorithm specific arguments
-    parser.add_argument("--num-agents", type=int, default=8,
+    parser.add_argument("--num-agents", type=int, default=4,
         help="number of agents in the environment")
     parser.add_argument("--num-envs", type=int, default=600,
         help="number of parallel envs per worker (=> 600*100=60k frames/batch)")
@@ -258,7 +258,7 @@ if __name__ == "__main__":
             
             # logging episode return and length
             if episode_ret and global_step > 100:
-                print(f"global_step={global_step}, episodic_return={np.mean(episode_ret)}")
+                # print(f"global_step={global_step}, episodic_return={np.mean(episode_ret)}")
                 writer.add_scalar("charts/episodic_return", np.mean(episode_ret), global_step)
                 writer.add_scalar("charts/episodic_length", np.mean(episode_len), global_step)
 
@@ -368,6 +368,11 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        if global_step % 10_000_000 == 0 and global_step > 0:
+            torch.save(agent.actor.state_dict(), f"{run_name}_policy_{global_step}.pth")
+            torch.save(agent.critic.state_dict(), f"{run_name}_critic_{global_step}.pth")
+            print("SAVE MODEL in global_step = ", global_step)
 
     torch.save(agent.actor.state_dict(), "actor_vmas_shared.pth")
     torch.save(agent.critic.state_dict(), "critic_vmas_shared.pth")

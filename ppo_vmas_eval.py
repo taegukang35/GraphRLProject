@@ -14,11 +14,11 @@ from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import vmas
 
-scenario = "navigation"
-actor_path = "actor_vmas_central.pth"
+scenario = ["navigation", "sampling"][1]
+actor_path = "/home/tgkang/GraphRLProject/sampling__ppo_vmas_discrete_centralized__1__1748079694_policy.pth"
 device = torch.device("cuda")
 num_envs = 16
-num_agents = 8
+num_agents = 4
 seed = 1
 
 class Agent(nn.Module):
@@ -41,7 +41,7 @@ class Agent(nn.Module):
     
 
 envs = vmas.make_env(
-        scenario="navigation", # can be scenario name or BaseScenario class
+        scenario=scenario, # can be scenario name or BaseScenario class
         num_envs=num_envs,
         device=device, # "cpu", "cuda"
         continuous_actions=False,
@@ -52,7 +52,7 @@ envs = vmas.make_env(
         # If dict_spaces=True, the spaces will become Dict with each key being the agent's name
         grad_enabled=False, # If grad_enabled the simulator is differentiable and gradients can flow from output to input
         terminated_truncated=False, # If terminated_truncated the simulator will return separate `terminated` and `truncated` flags in the `done()`, `step()`, and `get_from_scenario()` functions instead of a single `done` flag
-        n_agents=8, # Additional arguments you want to pass to the scenario initialization
+        n_agents=num_agents, # Additional arguments you want to pass to the scenario initialization
     )
 
 obs_list = envs.reset()
