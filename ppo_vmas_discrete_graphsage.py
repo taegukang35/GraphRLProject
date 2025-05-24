@@ -179,7 +179,6 @@ class GraphSageAgent(nn.Module):
         edges = torch.stack([src_flat, dst_flat], dim=1).to(device)  # E_total x 2
         N = num_envs * n_agents
         degree = torch.bincount(dst_flat, minlength=N).to(device)
-
         h = self.gsage1(x_flat, edges, degree)
         h = self.gsage2(h, edges, degree)  # still N x hidden_dim
 
@@ -252,6 +251,8 @@ if __name__ == "__main__":
     # start the game
     global_step = 0
     SAVE_INTERVAL = 10_000_000
+    next_save = 0
+
     episode_returns = np.zeros(args.num_envs, dtype=np.float32)
     episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
     return_queue = deque(maxlen=100)
@@ -443,12 +444,11 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         
-        if global_step % SAVE_INTERVAL < 1000:
-            torch.save(agent.actor.state_dict(), f"{run_name}_policy_{global_step}.pth")
-            torch.save(agent.critic.state_dict(), f"{run_name}_critic_{global_step}.pth")
+        if global_step > next_save:
+            torch.save(agent.state_dict(), f"{run_name}_{global_step}.pth")
             print("SAVE MODEL in global_step = ", global_step)
+            next_save += SAVE_INTERVAL
 
-    torch.save(agent.actor.state_dict(), f"{run_name}_policy.pth")
-    torch.save(agent.critic.state_dict(), f"{run_name}_critic.pth")
+    torch.save(agent.state_dict(), f"{run_name}.pth")
     
     writer.close()
