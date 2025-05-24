@@ -51,7 +51,7 @@ def parse_args():
         help="gcn, mean, maxpool")
     parser.add_argument("--hidden-dim", type=int, default=64,
         help="dim of communicated observation")
-    parser.add_argument("--dist", type=float, default=0.1,
+    parser.add_argument("--dist", type=float, default=1.0,
         help="maximum comminicable distance")
     
     # Algorithm specific arguments
@@ -338,7 +338,8 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(communicated_obs).reshape(1, -1)
+            last_comm_obs = agent.get_communicated_obs(next_gnn_obs, positions)  
+            next_value = agent.get_value(last_comm_obs).reshape(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
