@@ -14,12 +14,34 @@ from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import vmas
 
-scenario = ["navigation", "sampling"][1]
-actor_path = "/home/tgkang/GraphRLProject/sampling__ppo_vmas_discrete_centralized__1__1748079694_policy.pth"
+include_agent_in_obs = [True, False][0]
+scenario = ["navigation", "sampling"][0]
+actor_path = "/home/tgkang/GraphRLProject/navigation__ppo_vmas_discrete_shared2__72__1748090726_policy.pth"
 device = torch.device("cuda")
 num_envs = 16
 num_agents = 4
 seed = 1
+
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+def make_grid(frames, ncols=4):
+    n = len(frames)
+    h, w, c = frames[0].shape
+    nrows = int(np.ceil(n / ncols))
+    grid = np.zeros((h * nrows, w * ncols, c), dtype=frames[0].dtype)
+    for idx, frame in enumerate(frames):
+        row = idx // ncols
+        col = idx % ncols
+        grid[row*h:(row+1)*h, col*w:(col+1)*w, :] = frame
+    return grid
+
+def add_agent_id(obs, num_envs, num_agents, device):
+    agent_ids = torch.eye(num_agents, device=device)  # [num_agents, num_agents]
+    agent_ids = agent_ids.unsqueeze(0).repeat(num_envs, 1, 1)  # [num_envs, num_agents, num_agents]
+    agent_ids = agent_ids.view(-1, num_agents)  # [num_envs * num_agents, num_agents]
+    return torch.cat([obs, agent_ids], dim=-1)  # [num_envs * num_agents, obs_dim + num_agents]
 
 class Agent(nn.Module):
     def __init__(self, obs_dim, act_dim):
@@ -62,7 +84,10 @@ act_dim = envs.action_space[0].n
 obs = torch.stack(obs_list, dim=1).to(device) # [num_envs, num_agents, obs_dim]
 obs = obs.view(-1, obs_dim) # [num_envs * num_agents, obs_dim]
 
-agent = Agent(obs_dim=obs_dim, act_dim=act_dim).to(device)
+if include_agent_in_obs:
+    obs = add_agent_id(obs, num_envs, num_agents, device) # [num_envs * num_agents, obs_dim + num_agents]
+
+agent = Agent(obs_dim=obs_dim + num_agents if include_agent_in_obs else 0, act_dim=act_dim).to(device)
 agent.actor.load_state_dict(torch.load(actor_path, map_location=device))
 agent.actor.eval()
 
@@ -79,9 +104,15 @@ for step in range(MAX_STEP):
     obs_list, rews, dones, info = envs.step(action_list)
     obs = torch.stack(obs_list, dim=1).to(device) # [num_envs, num_agents, obs_dim]
     obs = obs.view(-1, obs_dim) # [num_envs * num_agents, obs_dim]
+    if include_agent_in_obs:
+        obs = add_agent_id(obs, num_envs, num_agents, device) # [num_envs * num_agents, obs_dim + num_agents]
     if RENDER:
-        frame = envs.render(mode="rgb_array")
-        frame_list.append(frame)
+        frame = []
+        for i in range(num_envs):
+            # envs.render returns H×W×C numpy array
+            frame.append(envs.render(mode="rgb_array", env_index=i))
+        grid_img = make_grid(frame, ncols=4)
+        frame_list.append(grid_img)
 
 if RENDER:
     from moviepy.editor import ImageSequenceClip
