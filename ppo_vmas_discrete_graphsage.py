@@ -49,7 +49,7 @@ def parse_args():
     # GNN specific arguments
     parser.add_argument("--agg-type", type=str, default="gcn",
         help="gcn, mean, maxpool")
-    parser.add_argument("--hidden-dim", type=int, default=32,
+    parser.add_argument("--hidden-dim", type=int, default=64,
         help="dim of communicated observation")
     parser.add_argument("--dist", type=float, default=0.1,
         help="maximum comminicable distance")
@@ -177,7 +177,8 @@ class GraphSageAgent(nn.Module):
         src_flat = env_idx * n_agents + src_idx
         dst_flat = env_idx * n_agents + dst_idx
         edges = torch.stack([src_flat, dst_flat], dim=1).to(device)  # E_total x 2
-        degree = torch.bincount(dst_flat, minlength=n_agents).to(device)
+        N = num_envs * n_agents
+        degree = torch.bincount(dst_flat, minlength=N).to(device)
 
         h = self.gsage1(x_flat, edges, degree)
         h = self.gsage2(h, edges, degree)  # still N x hidden_dim
