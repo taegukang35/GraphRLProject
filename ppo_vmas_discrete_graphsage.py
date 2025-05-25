@@ -137,30 +137,6 @@ class GraphSageAgent(nn.Module):
             layer_init(nn.Linear(256, 1), std=1.0)
         )
 
-    def get_value(self, communicated_obs: torch.Tensor) -> torch.Tensor:
-        # communicated_obs: [-1, obs_dim]
-        return self.critic(communicated_obs)
-
-    def get_communicated_obs_slow(self, x: torch.Tensor, positions):
-        # x: [-1, num_agents, obs_dim]
-        # positions: [-1, num_agents, 2]
-        device = x.device
-        num_agents = x.shape[1]
-        # apply GCN per env
-        h_list = []
-        for e in range(x.shape[0]):
-            feat_e = x[e] # [num_agents, obs_dim]
-            coord_e = positions[e] # [num_agents, 2]
-            edges_e = build_edge_lists(coord_e, num_agents, self.dist)
-            edges_e = torch.tensor(edges_e).to(device) # [num_edges, 2]
-            degree_e = torch.bincount(edges_e[:,1], minlength=num_agents).to(device) # [num_agents, ]
-            h_e = self.gsage1(feat_e, edges_e, degree_e)
-            h_e = self.gsage2(h_e, edges_e, degree_e) # [num_agents, obs_dim]
-            h_list.append(h_e)
-        # flatten back
-        h = torch.cat(h_list, dim=0)  # [-1, 64]
-        return h
-    
     def get_communicated_obs(self, x: torch.Tensor, positions: torch.Tensor):
         """
         x: [num_envs, num_agents, obs_dim]
@@ -169,30 +145,54 @@ class GraphSageAgent(nn.Module):
         device = x.device
         num_envs, n_agents, feat_dim = x.shape
 
-        # 1) Flatten node features: [N, feat_dim], N = num_envs * n_agents
-        x_flat = x.view(-1, feat_dim)  # N x feat_dim
-        dist_mat = torch.cdist(positions, positions, p=2)
-        mask = dist_mat <= self.dist  # [E, N, N]
-        env_idx, src_idx, dst_idx = mask.nonzero(as_tuple=True)
+        x_flat = x.reshape(-1, feat_dim)  # Shape: [num_envs * n_agents, feat_dim]
+        batch_idx = torch.arange(num_envs, device=device).repeat_interleave(n_agents * n_agents)
+        dist_mat = torch.cdist(positions, positions, p=2) # [num_envs, n_agents, n_agents]
+        mask = dist_mat <= self.dist  # [num_envs, n_agents, n_agents]
+        
+        # Create edge list
+        adj = mask.to(torch.int)
+        env_idx, src_idx, dst_idx = adj.nonzero(as_tuple=True)
+        
+        # Offset indices to be unique across the flattened batch
         src_flat = env_idx * n_agents + src_idx
         dst_flat = env_idx * n_agents + dst_idx
-        edges = torch.stack([src_flat, dst_flat], dim=1).to(device)  # E_total x 2
-        N = num_envs * n_agents
-        degree = torch.bincount(dst_flat, minlength=N).to(device)
+        edges = torch.stack([src_flat, dst_flat], dim=1).to(device)
+        
+        N_total_nodes = num_envs * n_agents
+        degree = torch.bincount(dst_flat, minlength=N_total_nodes).to(device)
+        
         h = self.gsage1(x_flat, edges, degree)
-        h = self.gsage2(h, edges, degree)  # still N x hidden_dim
+        h = self.gsage2(h, edges, degree) # Shape: [num_envs * n_agents, hidden_dim]
 
-        return h  # [num_envs * num_agents, hidden_dim]
-    
-    def get_action_and_value(self, communicated_obs, action=None):
-        # communicated_obs: [-1, obs_dim]
-        logits = self.policy_head(communicated_obs)
+        return h
+
+    def get_value(self, raw_obs_batch: torch.Tensor, positions_batch: torch.Tensor) -> torch.Tensor:
+        # raw_obs_batch: [num_envs_in_batch, num_agents, raw_obs_dim (obs_dim + num_agents)]
+        # positions_batch: [num_envs_in_batch, num_agents, pos_dim]
+        communicated_obs = self.get_communicated_obs(raw_obs_batch, positions_batch)
+        # communicated_obs shape: [num_envs_in_batch * num_agents, hidden_dim]
+        return self.critic(communicated_obs) # Output shape: [num_envs_in_batch * num_agents, 1]
+
+    def get_action_and_value(self, raw_obs_batch: torch.Tensor, positions_batch: torch.Tensor, action:torch.Tensor=None):
+        # raw_obs_batch: [num_envs_in_batch, num_agents, raw_obs_dim]
+        # positions_batch: [num_envs_in_batch, num_agents, pos_dim]
+        communicated_obs = self.get_communicated_obs(raw_obs_batch, positions_batch)
+        # communicated_obs shape: [num_envs_in_batch * num_agents, hidden_dim]
+        
+        logits = self.policy_head(communicated_obs) # Shape: [num_envs_in_batch * num_agents, act_dim]
         dist = Categorical(logits=logits)
         if action is None:
-            action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), self.critic(communicated_obs)
+            action = dist.sample() # Shape: [num_envs_in_batch * num_agents]
+        
+        log_probs = dist.log_prob(action) # Shape: [num_envs_in_batch * num_agents]
+        entropy = dist.entropy()         # Shape: [num_envs_in_batch * num_agents]
+        value = self.critic(communicated_obs) # Shape: [num_envs_in_batch * num_agents, 1]
+        
+        return action, log_probs, entropy, value
 
     def get_action(self, x, deterministic=True):
+
         pass
         
 if __name__ == "__main__":
@@ -233,15 +233,17 @@ if __name__ == "__main__":
     )
 
     # check dim of env
-    obs_list = envs.reset()
-    obs_dim = obs_list[0].shape[-1]
+    # Reset envs to get obs_dim and act_dim
+    initial_obs_list = envs.reset() 
+    obs_dim = initial_obs_list[0].shape[-1] # obs_dim for a single agent
     act_dim = envs.action_space[0].n
     
     agent = GraphSageAgent(obs_dim=obs_dim + args.num_agents, act_dim=act_dim, hidden_dim=args.hidden_dim, dist=args.dist, agg_type=args.agg_type).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs * args.num_agents, args.hidden_dim)).to(device)
+    raw_obs_storage = torch.zeros((args.num_steps, args.num_envs, args.num_agents, obs_dim + args.num_agents)).to(device)
+    positions_storage = torch.zeros((args.num_steps, args.num_envs, args.num_agents, 2)).to(device) # Assuming 2D positions
     actions = torch.zeros((args.num_steps, args.num_envs * args.num_agents)).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs * args.num_agents)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs * args.num_agents)).to(device)
@@ -250,206 +252,227 @@ if __name__ == "__main__":
     
     # start the game
     global_step = 0
-    SAVE_INTERVAL = 10_000_000
-    next_save = 0
+    SAVE_INTERVAL = 10_000_000 # You can adjust this
+    next_save_step = SAVE_INTERVAL # Changed variable name for clarity
 
-    episode_returns = np.zeros(args.num_envs, dtype=np.float32)
-    episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
-    return_queue = deque(maxlen=100)
-    length_queue = deque(maxlen=100)
+    # Episode tracking
+    current_episode_returns = np.zeros(args.num_envs, dtype=np.float32)
+    current_episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
+
     start_time = time.time()
-    next_obs_list = envs.reset(seed=args.seed) # (num_envs, obs_dim) per agents
-    next_obs = torch.stack(next_obs_list, dim=1).to(device) # [num_envs, num_agents, obs_dim]
-    next_obs = next_obs.view(-1, obs_dim) # [num_envs * num_agents, obs_dim]
-    next_obs = add_agent_id(next_obs, args.num_envs, args.num_agents, device) # [num_envs * num_agents, obs_dim + num_agents]
-    next_gnn_obs = next_obs.view(-1, args.num_agents, obs_dim + args.num_agents) # [-1, num_agents, obs_dim]
-    
-    next_done = torch.zeros(args.num_envs * args.num_agents).to(device)
-    num_updates = args.total_timesteps // args.batch_size
+    # Initial reset and observation processing
+    next_obs_list = envs.reset(seed=args.seed) # List of obs_per_agent, each [num_envs, obs_dim_agent]
+    next_obs_stacked = torch.stack(next_obs_list, dim=1).to(device) # [num_envs, num_agents, obs_dim]
+    next_obs_flat_for_id = next_obs_stacked.reshape(-1, obs_dim) # [num_envs * num_agents, obs_dim]
+    next_obs_with_id_flat = add_agent_id(next_obs_flat_for_id, args.num_envs, args.num_agents, device)
+    next_gnn_obs = next_obs_with_id_flat.reshape(args.num_envs, args.num_agents, obs_dim + args.num_agents)
 
-    positions = []
-    for e in range(args.num_envs):
-        coords = torch.stack([agent.state.pos[e] for agent in envs.agents], dim=0).to(device)  # [n_agents, pos_dim]
-        positions.append(coords)
-    positions = torch.stack(positions, dim=0).to(device)  # [-1, num_agents, 2]
+    current_positions = torch.zeros(args.num_envs, args.num_agents, 2, device=device) # Assuming 2D positions
+    for e_idx in range(args.num_envs): # Initial positions
+        env_agent_pos_list = []
+        for agent_idx_in_env in range(args.num_agents):
+            env_agent_pos_list.append(envs.agents[agent_idx_in_env].state.pos[e_idx])
+        current_positions[e_idx] = torch.stack(env_agent_pos_list, dim=0)
+    
+    next_done = torch.zeros(args.num_envs, args.num_agents, device=device) # [num_envs, num_agents]
+    agent_steps_per_rollout = args.num_envs * args.num_steps * args.num_agents
+    num_updates = args.total_timesteps // agent_steps_per_rollout
+
 
     for update in range(1, num_updates + 1):
-        # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # Temporary lists to store returns and lengths of completed episodes in this rollout
+        completed_episode_returns = []
+        completed_episode_lengths = []
+
         for step in range(0, args.num_steps):
-            global_step += 1 * args.num_envs
-            dones[step] = next_done
+            # global_step should count agent steps
+            global_step += args.num_envs * args.num_agents # Increment by total agent steps in this env step
+            
+            raw_obs_storage[step] = next_gnn_obs
+            positions_storage[step] = current_positions
+            dones[step] = next_done.flatten() 
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
-                communicated_obs = agent.get_communicated_obs(next_gnn_obs, positions)
-                action, logprob, entropy, value = agent.get_action_and_value(communicated_obs)
+                action, logprob, entropy, value = agent.get_action_and_value(next_gnn_obs, current_positions)
 
-            obs[step] = communicated_obs
-            values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
+            values[step] = value.flatten() 
+            actions[step] = action         
+            logprobs[step] = logprob       
 
-            # execute the game and log data
-            action_array = action.view(args.num_envs, args.num_agents).cpu().numpy()
-            action_list = [action_array[:, i] for i in range(args.num_agents)]
-            next_obs_list, reward_list, done, info = envs.step(action_list)
+            action_array = action.reshape(args.num_envs, args.num_agents).cpu().numpy()
+            action_list_for_env = [action_array[:, i] for i in range(args.num_agents)]
+            next_obs_list_from_env, reward_list_from_env, done_from_env, info = envs.step(action_list_for_env)
             
-            reward = torch.stack(reward_list, dim=1).to(device)
-            env_rewards = torch.sum(reward, dim=1).cpu().numpy()
-            episode_returns += env_rewards
-            episode_lengths += 1
+            reward_tensor = torch.stack(reward_list_from_env, dim=1).to(device) 
+            rewards[step] = reward_tensor.flatten() 
 
-            rewards[step] = reward.flatten()
+            # Update episodic counts
+            env_reward_sum = reward_tensor.sum(dim=1).cpu().numpy()
+            current_episode_returns += env_reward_sum
+            current_episode_lengths += 1
 
-            next_obs = torch.stack(next_obs_list, dim=1).to(device) # [num_envs, num_agents, obs_dim]
-            next_obs = next_obs.view(-1, obs_dim) # [num_envs * num_agents, obs_dim]
-            next_obs = add_agent_id(next_obs, args.num_envs, args.num_agents, device) # [num_envs * num_agents, obs_dim + num_agents]
-            next_gnn_obs = next_obs.view(-1, args.num_agents, obs_dim + args.num_agents)
+            next_obs_stacked_env = torch.stack(next_obs_list_from_env, dim=1).to(device)
+            next_obs_flat_for_id_env = next_obs_stacked_env.reshape(-1, obs_dim)
+            next_obs_with_id_flat_env = add_agent_id(next_obs_flat_for_id_env, args.num_envs, args.num_agents, device)
+            next_gnn_obs = next_obs_with_id_flat_env.reshape(args.num_envs, args.num_agents, obs_dim + args.num_agents)
 
-            next_done = done.to(device).unsqueeze(1).repeat(1, args.num_agents) # [num_envs, ] => [num_envs, num_agents]
-            next_done = next_done.flatten() # [num_envs * num_agents, ]
-
-            positions = []
-            for e in range(args.num_envs):
-                coords = torch.stack([agent.state.pos[e] for agent in envs.agents], dim=0).to(device)  # [n_agents, pos_dim]
-                positions.append(coords)
-            positions = torch.stack(positions, dim=0).to(device)  # [-1, num_agents, 2]
-
-            episode_ret = []
-            episode_len = []
+            for e_idx in range(args.num_envs):
+                env_agent_pos_list = []
+                for agent_idx_in_env in range(args.num_agents):
+                     env_agent_pos_list.append(envs.agents[agent_idx_in_env].state.pos[e_idx]) # VMAS specific
+                current_positions[e_idx] = torch.stack(env_agent_pos_list, dim=0)
             
-            for i in range(len(done)):
-                if done[i]:
-                    episode_ret.append(episode_returns[i])
-                    episode_len.append(episode_lengths[i])
-                    episode_returns[i] = 0
-                    episode_lengths[i] = 0
-            
-            # logging episode return and length
-            if episode_ret and global_step > 100:
-                # print(f"global_step={global_step}, episodic_return={np.mean(episode_ret)}")
-                writer.add_scalar("charts/episodic_return", np.mean(episode_ret), global_step)
-                writer.add_scalar("charts/episodic_length", np.mean(episode_len), global_step)
+            # done_from_env is [num_envs]. If an env is done, all agents in it are considered done for GAE.
+            # next_done should be [num_envs, num_agents] for storage and GAE logic
+            next_done = done_from_env.to(device).unsqueeze(1).repeat(1, args.num_agents)
 
-        # bootstrap value if not done
+            # Check for completed episodes and log them
+            for i in range(args.num_envs):
+                if done_from_env[i]:
+                    completed_episode_returns.append(current_episode_returns[i])
+                    completed_episode_lengths.append(current_episode_lengths[i])
+                    current_episode_returns[i] = 0
+                    current_episode_lengths[i] = 0
+        
+        if completed_episode_returns: 
+            avg_episode_return = np.mean(completed_episode_returns)
+            avg_episode_length = np.mean(completed_episode_lengths)
+            print(f"Global Step: {global_step}, Avg Episodic Return: {avg_episode_return}, Avg Episodic Length: {avg_episode_length}")
+            writer.add_scalar("charts/avg_episodic_return", avg_episode_return, global_step)
+            writer.add_scalar("charts/avg_episodic_length", avg_episode_length, global_step)
+
+
         with torch.no_grad():
-            last_comm_obs = agent.get_communicated_obs(next_gnn_obs, positions)  
-            next_value = agent.get_value(last_comm_obs).reshape(1, -1)
+            next_value_agents = agent.get_value(next_gnn_obs, current_positions).flatten() 
             if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
+                advantages = torch.zeros_like(rewards).to(device) 
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done.float()
-                        nextvalues = next_value
+                        # next_done is [num_envs, num_agents] from the last step of the rollout
+                        nextnonterminal = 1.0 - next_done.flatten().float() 
+                        nextvalues_gae = next_value_agents
                     else:
-                        nextnonterminal = 1.0 - dones[t + 1].float()
-                        nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                        # dones[t+1] is already flat [num_envs*num_agents]
+                        nextnonterminal = 1.0 - dones[t + 1].float() 
+                        nextvalues_gae = values[t + 1] 
+                    delta = rewards[t] + args.gamma * nextvalues_gae * nextnonterminal - values[t]
                     advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 returns = advantages + values
             else:
                 returns = torch.zeros_like(rewards).to(device)
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done.float()
-                        next_return = next_value
+                        nextnonterminal = 1.0 - next_done.flatten().float()
+                        next_return_val = next_value_agents
                     else:
-                        nextnonterminal = 1.0 - dones[t + 1].float()
-                        next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
+                        nextnonterminal = 1.0 - dones[t+1].float()
+                        next_return_val = returns[t+1]
+                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return_val
                 advantages = returns - values
 
-        # flatten the batch
-        b_obs = obs.reshape((-1, args.hidden_dim))
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,1))
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        num_env_steps_in_buffer = args.num_envs * args.num_steps
+        
+        b_gnn_obs_input = raw_obs_storage.permute(1, 0, 2, 3).reshape(num_env_steps_in_buffer, args.num_agents, obs_dim + args.num_agents)
+        b_gnn_pos_input = positions_storage.permute(1, 0, 2, 3).reshape(num_env_steps_in_buffer, args.num_agents, 2)
 
-        # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        b_actions_flat = actions.reshape(-1) 
+        b_logprobs_flat = logprobs.reshape(-1)
+        b_advantages_flat = advantages.reshape(-1)
+        b_returns_flat = returns.reshape(-1)
+        b_values_flat = values.reshape(-1) 
+
+        env_step_indices_for_ppo_batch = np.arange(num_env_steps_in_buffer)
+
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            np.random.shuffle(env_step_indices_for_ppo_batch)
+            for start in range(0, num_env_steps_in_buffer, args.minibatch_size):
                 end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+                mb_env_step_inds = env_step_indices_for_ppo_batch[start:end] 
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                current_mb_raw_obs = b_gnn_obs_input[mb_env_step_inds]
+                current_mb_positions = b_gnn_pos_input[mb_env_step_inds]
                 
-                logratio = newlogprob - b_logprobs[mb_inds]
+                mb_agent_actions = b_actions_flat.view(num_env_steps_in_buffer, args.num_agents)[mb_env_step_inds].reshape(-1).long()
+                mb_agent_logprobs_old = b_logprobs_flat.view(num_env_steps_in_buffer, args.num_agents)[mb_env_step_inds].reshape(-1)
+                mb_agent_advantages = b_advantages_flat.view(num_env_steps_in_buffer, args.num_agents)[mb_env_step_inds].reshape(-1)
+                mb_agent_returns = b_returns_flat.view(num_env_steps_in_buffer, args.num_agents)[mb_env_step_inds].reshape(-1)
+                mb_agent_values_old = b_values_flat.view(num_env_steps_in_buffer, args.num_agents)[mb_env_step_inds].reshape(-1)
+                
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    current_mb_raw_obs,
+                    current_mb_positions,
+                    action=mb_agent_actions 
+                )
+                newvalue = newvalue.flatten()
+
+                logratio = newlogprob - mb_agent_logprobs_old
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
-                mb_advantages = b_advantages[mb_inds]
+                current_mb_advantages = mb_agent_advantages
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    current_mb_advantages = (current_mb_advantages - current_mb_advantages.mean()) / (current_mb_advantages.std() + 1e-8)
 
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss1 = -current_mb_advantages * ratio
+                pg_loss2 = -current_mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
-                newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (newvalue - mb_agent_returns) ** 2
+                    v_clipped = mb_agent_values_old + torch.clamp(
+                        newvalue - mb_agent_values_old,
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - mb_agent_returns) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - mb_agent_returns) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
+                # Removed the gradient print loop for cleaner output, can be re-added for debugging
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-            if args.target_kl is not None:
-                if approx_kl > args.target_kl:
-                    break
+            if args.target_kl is not None and approx_kl > args.target_kl:
+                break
+        
+        y_pred_old, y_true_old = b_values_flat.cpu().numpy(), b_returns_flat.cpu().numpy()
+        var_y_old = np.var(y_true_old)
+        explained_var = np.nan if var_y_old == 0 else 1 - np.var(y_true_old - y_pred_old) / var_y_old
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        # record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step) # clipfracs could be empty if update_epochs is 0 or 1
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
+        print(f"SPS: {int(global_step / (time.time() - start_time))}")
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         
-        if global_step > next_save:
+        if global_step >= next_save_step : # Check if current global_step has passed the next save point
             torch.save(agent.state_dict(), f"{run_name}_{global_step}.pth")
-            print("SAVE MODEL in global_step = ", global_step)
-            next_save += SAVE_INTERVAL
+            print(f"SAVE MODEL in global_step = {global_step}")
+            next_save_step += SAVE_INTERVAL
 
-    torch.save(agent.state_dict(), f"{run_name}.pth")
+    torch.save(agent.state_dict(), f"{run_name}_final.pth") # Save final model
     
     writer.close()
